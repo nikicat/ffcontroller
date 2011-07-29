@@ -1,0 +1,2 @@
+ffcontroller is a controller daemon fro Firefox "socat" add-on
+it accepts connections from addons and send commands to them
