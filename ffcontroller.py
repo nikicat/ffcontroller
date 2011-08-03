@@ -11,15 +11,18 @@ import http.server
 import http.client
 import json
 import datetime
+from collections import defaultdict, deque
 
 global logger
 global options
 global control_connections
 global proxy_connections
+global host_connections
 logger = logging.basicConfig(level=logging.DEBUG)
 netloc_queue = queue.Queue()
 control_connections = []
 proxy_connections = []
+host_connections = defaultdict(deque)
 
 class ControlConnectionHandler(socketserver.StreamRequestHandler):
     def setup(self):
@@ -54,100 +57,16 @@ class ControlConnectionHandler(socketserver.StreamRequestHandler):
         global control_connections
         control_connections.remove(self)
 
-class SocketHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, sock):
+class BackHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, netloc):
         http.client.HTTPConnection.__init__(self, '', 0)
-        self.sock = sock
+        self.netloc = netloc
+        self.logger = logging.getLogger('ffcontroller.host-connection.{0}'.format(netloc))
 
-class HTTPProxyRequestHandler(http.server.BaseHTTPRequestHandler):
-    rbufsize = 0
+    def __str__(self):
+        return self.netloc
 
-    def setup(self):
-        self.logger = logging.getLogger('ffcontroller.http-proxy.{0}'.format(self.address_string()))
-        self.logger.info('started')
-        self.start_time = datetime.datetime.now()
-        self.last_send_time = self.start_time
-        global proxy_connections
-        proxy_connections.append(self)
-        http.server.BaseHTTPRequestHandler.setup(self)
-
-    def finish(self):
-        http.server.BaseHTTPRequestHandler.finish(self)
-        global proxy_connections
-        proxy_connections.remove(self)
-        self.logger.info('finished')
-
-    def do_GET(self):
-        r = urllib.parse.urlparse(self.path)
-        peernetloc = r.netloc
-        if r.port is None:
-            port = {'http': 80}[r.scheme]
-            peernetloc += ':' + str(port)
-        backsock = self.establish_backconn(peernetloc)
-        backconn = SocketHTTPConnection(backsock)
-        unparsedurl = urllib.parse.urlunparse(('', None, r.path, r.params, r.query, r.fragment))
-        if unparsedurl == '':
-            unparsedurl = '/'
-        headers = dict(self.headers)
-        headers.pop('Proxy-Connection', None)
-        if self.command in ('POST', 'PUT'):
-            body = self.rfile
-        else:
-            body = None
-        self.logger.debug('sending request: {0} {1}'.format(self.command, unparsedurl))
-        backconn.request(self.command, unparsedurl, body, headers)
-        response = backconn.getresponse()
-        self.logger.debug('received response: {0} {1}'.format(response.status, response.reason))
-        self.send_response_only(response.status, response.reason)
-        for key, value in response.getheaders():
-            self.logger.debug('sending header: "{0}: {1}"'.format(key, value))
-            self.send_header(key, value)
-        self.end_headers()
-        self.last_send_time = datetime.datetime.now()
-        while response.length or response.chunked:
-            data = response.read(8192)
-            if len(data) == 0:
-                self.logger.info('server connection closed while sending body: {0} bytes left'.format(response.length))
-                break
-            self.logger.debug('sending body: {0} bytes'.format(len(data)))
-            self.wfile.write(data)
-            self.last_send_time = datetime.datetime.now()
-
-    do_POST = do_PUT = do_HEAD = do_GET
-
-    def do_CONNECT(self):
-        try:
-            backconn = self.establish_backconn(self.path)
-            self.send_response(200)
-        except:
-            self.send_response(503)
-        finally:
-            self.end_headers()
-            self.last_send_time = datetime.datetime.now()
-
-        def pump(source, dest):
-            logger = logging.getLogger('{0}.{1}'.format(self.logger.name, threading.current_thread().name))
-            while True:
-                data = source.read(8192)
-                logger.debug('pumping {0} bytes'.format(len(data)))
-                if len(data) == 0:
-                    logger.debug('connection closed. closing opposite side.')
-                    dest._sock.close()
-                    break
-                dest.write(data)
-                self.last_send_time = datetime.datetime.now()
-
-        client_addr = '{0}:{1}'.format(*socket.getnameinfo(self.request.getpeername(), 0))
-        server_addr = '{0}:{1}'.format(*socket.getnameinfo(backconn.getpeername(), 0))
-        self.logger.debug('pumping between {0} and {1}'.format(client_addr, server_addr))
-        pump_threads = [threading.Thread(target=pump, args=(backconn.makefile('rb', 0), self.wfile), name='server-to-client'),
-                        threading.Thread(target=pump, args=(self.rfile, backconn.makefile('wb', 0)), name='client-to-server')]
-        # pump data until the end
-        list(map(threading.Thread.start, pump_threads))
-        list(map(threading.Thread.join, pump_threads))
-
-    def establish_backconn(self, peernetloc):
-        self.peernetloc = peernetloc
+    def connect(self):
         # create listening socket for back connection
         backserv = socket.socket()
         global options
@@ -161,17 +80,178 @@ class HTTPProxyRequestHandler(http.server.BaseHTTPRequestHandler):
         backserv.listen(1)
         while True:
             # put both locations to queue
-            netloc_queue.put((selfnetloc, peernetloc))
+            netloc_queue.put((selfnetloc, self.netloc))
             # wait for connection
             try:
-                backconn,peeraddr = backserv.accept()
+                self.sock,peeraddr = backserv.accept()
                 break
             except socket.timeout:
                 self.logger.debug('timeout while accepting back connection. resending request.')
         self.logger.debug('accepted back connection from {0}:{1}'.format(*socket.getnameinfo(peeraddr, 0)))
         # close server socket
         backserv.close()
-        return backconn
+
+    def check(self):
+        if self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) != 0:
+            self.close()
+        return self.sock is not None
+
+class HTTPProxyRequestHandler(http.server.BaseHTTPRequestHandler):
+    rbufsize = 0
+    protocol_version = 'HTTP/1.1'
+
+    def setup(self):
+        self.logger = logging.getLogger('ffcontroller.http-proxy.{0}_{1}'.format(self.address_string().replace(':','_'), self.client_address[1]))
+        self.start_time = datetime.datetime.now()
+        self.last_send_time = self.start_time
+        self.peernetloc = ''
+        global proxy_connections
+        proxy_connections.append(self)
+        http.server.BaseHTTPRequestHandler.setup(self)
+
+    def finish(self):
+        http.server.BaseHTTPRequestHandler.finish(self)
+        global proxy_connections
+        proxy_connections.remove(self)
+        self.logger.info('finished')
+
+    def do_GET(self):
+        self.logger.info('{0} {1} {2}'.format(self.command, self.path, self.request_version))
+        for key, value in self.headers.items():
+            self.logger.debug('request header: "{0}: {1}"'.format(key, value))
+        r = urllib.parse.urlparse(self.path)
+        peernetloc = r.netloc
+        if r.port is None:
+            port = {'http': 80}[r.scheme]
+            peernetloc += ':' + str(port)
+        global host_connections
+        for i in range(options.retry_count):
+            try:
+                while len(host_connections[peernetloc]) > 0:
+                    backconn = host_connections[peernetloc].popleft()
+                    if backconn.check():
+                        self.logger.debug('reusing connection: {0}'.format(backconn))
+                        break
+                else:
+                    backconn = BackHTTPConnection(peernetloc)
+                response = self.send_request(r, backconn)
+                self.send_full_response(response)
+                if backconn.sock is not None and backconn.sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0:
+                    # Do not forget to close response to reuse connection later
+                    response.close()
+                    self.logger.debug('storing connection for reusing later: {0}'.format(backconn))
+                    host_connections[peernetloc].append(backconn)
+                break
+            except Exception as e:
+                self.logger.error('{0}: {1}'.format(type(e).__name__, e))
+                self.logger.info('retrying request: {0} {1}'.format(self.command, self.path))
+        else:
+            self.send_error(504)
+
+    def send_request(self, r, backconn):
+        unparsedurl = urllib.parse.urlunparse(('', None, r.path, r.params, r.query, r.fragment))
+        if unparsedurl == '':
+            unparsedurl = '/'
+        # Remove Proxy-Connection hack header and add Connection header
+        headers = dict(self.headers)
+        headers.pop('Proxy-Connection', None)
+        headers['Connection'] = 'Keep-Alive'
+        if self.command in ('POST', 'PUT'):
+            body = self.rfile
+        else:
+            body = None
+        self.logger.debug('request: {0} {1}'.format(self.command, unparsedurl))
+        backconn.request(self.command, unparsedurl, body, headers)
+        return backconn.getresponse()
+
+    def send_full_response(self, response):
+        self.logger.debug('response: {0} {1}'.format(response.status, response.reason))
+        self.send_response_only(response.status, response.reason)
+        for key, value in response.getheaders():
+            self.logger.debug('response header: "{0}: {1}"'.format(key, value))
+            self.send_header(key, value)
+        self.end_headers()
+        self.last_send_time = datetime.datetime.now()
+        if response.chunked:
+            # We will read response manually in intention to get chunk headers and send them to client
+            # Read chunks
+            while True:
+                chunk_header = response.fp.readline()
+                self.logger.debug('sending chunk header {0}'.format(chunk_header[:-2].decode()))
+                self.wfile.write(chunk_header)
+                length = int(chunk_header.split(b';')[0], 16)
+                self.logger.debug('received chunk header. chunk length is {0} byes'.format(length))
+                if length == 0:
+                    self.logger.debug('received zero length chunk. stopping transmission')
+                    break
+                while length > 0:
+                    data = response.fp.read(min(8192, length))
+                    if len(data) == 0:
+                        raise socket.error('connection closed')
+                    self.last_send_time = datetime.datetime.now()
+                    length -= len(data)
+                    self.logger.debug('sending part of chunk with size {0} bytes'.format(len(data)))
+                    self.wfile.write(data)
+                crlf = response.fp.read(2)
+                if crlf != b'\r\n':
+                    self.logger.warning('not CRLF at the end of chunk, but {0}'.format(crlf))
+                self.last_send_time = datetime.datetime.now()
+                self.wfile.write(crlf)
+            # Read the trailer
+            while True:
+                line = response.fp.readline()
+                if not line:
+                    break
+                self.last_send_time = datetime.datetime.now()
+                self.wfile.write(line)
+                if line == b'\r\n':
+                    break
+        else:
+            while response.length:
+                data = response.read(8192)
+                if len(data) == 0:
+                    self.logger.info('server connection closed while sending body: {0} bytes left'.format(response.length))
+                    break
+                self.logger.debug('sending body: {0} bytes'.format(len(data)))
+                self.wfile.write(data)
+                self.last_send_time = datetime.datetime.now()
+
+    do_POST = do_PUT = do_HEAD = do_GET
+
+    def do_CONNECT(self):
+        try:
+            backconn = BackHTTPConnection(self.path)
+            backconn.connect()
+            self.send_response(200)
+        except:
+            self.send_response(503)
+        finally:
+            self.end_headers()
+            self.last_send_time = datetime.datetime.now()
+
+        def pump(source, dest):
+            logger = logging.getLogger('{0}.{1}'.format(self.logger.name, threading.current_thread().name))
+            try:
+                while True:
+                    data = source.read(8192)
+                    logger.debug('pumping {0} bytes'.format(len(data)))
+                    if len(data) == 0:
+                        raise socket.error('connection closed')
+                    dest.write(data)
+                    self.last_send_time = datetime.datetime.now()
+            except Exception as e:
+                logger.debug('{0}. closing both sides.'.format(e))
+                dest._sock.close()
+                source._sock.close()
+
+        client_addr = '{0}:{1}'.format(*socket.getnameinfo(self.request.getpeername(), 0))
+        server_addr = '{0}:{1}'.format(*socket.getnameinfo(backconn.sock.getpeername(), 0))
+        self.logger.debug('pumping between {0} and {1}'.format(client_addr, server_addr))
+        pump_threads = [threading.Thread(target=pump, args=(backconn.sock.makefile('rb', 0), self.wfile), name='s2c'),
+                        threading.Thread(target=pump, args=(self.rfile, backconn.sock.makefile('wb', 0)), name='c2s')]
+        # pump data until the end
+        list(map(threading.Thread.start, pump_threads))
+        list(map(threading.Thread.join, pump_threads))
 
 class AdminRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -264,7 +344,7 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 def start_server(server_class, handler, address, port):
     infos = socket.getaddrinfo(address, port, 0, socket.SOCK_STREAM)
     for family, socktype, proto, canonname, sockaddr in infos:
-        logging.debug('creating threaded tcp server with {0} {1} {2} {3} {4}'.format(family, socktype, proto, canonname, sockaddr))
+        logging.debug('creating {5} with {0} {1} {2} {3} {4}'.format(family, socktype, proto, canonname, sockaddr, server_class.__name__))
         server = server_class(family, sockaddr, handler)
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
@@ -279,6 +359,7 @@ if __name__ == '__main__':
     parser.add_argument('--backconn-timeout', dest='backconn_timeout', type=float, default=3.0)
     parser.add_argument('--admin-address', dest='admin_address', default='::')
     parser.add_argument('--admin-port', dest='admin_port', type=int, default=4002)
+    parser.add_argument('--retry-count', dest='retry_count', type=int, default=3)
 
     global options
     options = parser.parse_args()
