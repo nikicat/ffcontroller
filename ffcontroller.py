@@ -14,6 +14,8 @@ import datetime
 from collections import defaultdict, deque
 import itertools
 import errno
+import pygeoip
+import IPy
 
 global logger
 global options
@@ -25,9 +27,14 @@ netloc_queue = queue.Queue()
 control_connections = []
 proxy_connections = []
 host_connections = defaultdict(deque)
+geoip = pygeoip.GeoIP('/usr/share/GeoIP/GeoIPCity.dat')
 
 class ControlConnectionHandler(socketserver.StreamRequestHandler):
     def setup(self):
+        # some hack for mapped IPv4-to-IPv6 addresses
+        ip = IPy.IP(self.client_address[0])
+        if ip.iptype() == 'IPV4MAP':
+            self.client_address = (ip._getIPv4Map().strNormal(), self.client_address[1])
         client_name = socket.getnameinfo(self.client_address, socket.NI_NUMERICSERV)
         self.logger = logging.getLogger('ffcontroller.control-connection.{0}'.format(*client_name))
         self.start_time = datetime.datetime.now()
@@ -121,13 +128,11 @@ class HTTPProxyRequestHandler(http.server.BaseHTTPRequestHandler):
         self.last_send_time = self.start_time
         self.peernetloc = ''
         self.last_request = ''
-        global proxy_connections
         proxy_connections.append(self)
         http.server.BaseHTTPRequestHandler.setup(self)
 
     def finish(self):
         http.server.BaseHTTPRequestHandler.finish(self)
-        global proxy_connections
         proxy_connections.remove(self)
         self.logger.info('finished')
 
@@ -141,7 +146,6 @@ class HTTPProxyRequestHandler(http.server.BaseHTTPRequestHandler):
         if r.port is None:
             port = {'http': 80}[r.scheme]
             peernetloc += ':' + str(port)
-        global host_connections
         for i in range(options.retry_count):
             try:
                 while len(host_connections[peernetloc]) > 0:
@@ -283,7 +287,7 @@ class AdminRequestHandler(http.server.BaseHTTPRequestHandler):
                 @import "http://www.datatables.net/release-datatables/media/css/demo_table_jui.css";
                 @import "http://www.datatables.net/release-datatables/examples/examples_support/themes/smoothness/jquery-ui-1.8.4.custom.css";
             </style>
-            <script type="text/javascript" language="javascript" src="http://www.datatables.net/release-datatables/media/js/jquery.js"></script>
+            <script type="text/javascript" language="javascript" src="http://yandex.st/jquery/1.6.2/jquery.js"></script>
 
             <script type="text/javascript" language="javascript" src="http://www.datatables.net/release-datatables/media/js/jquery.dataTables.js"></script>
             <script type="text/javascript" charset="utf-8">
@@ -311,6 +315,7 @@ class AdminRequestHandler(http.server.BaseHTTPRequestHandler):
                 <table class="display" id="control-connections">
                     <thead>
                         <th>Client address</th>
+                        <th>Geolocation</th>
                         <th>Established time</th>
                         <th>Commands sent</th>
                         <th>Idle time</th>
@@ -345,11 +350,17 @@ class AdminRequestHandler(http.server.BaseHTTPRequestHandler):
             '''
             content_type = 'text/html; charset=UTF-8'
         elif self.path.startswith('/control-connections'):
-            data = {'aaData': [['{0}:{1}'.format(*socket.getnameinfo(cc.client_address, 0)), str(now - cc.start_time), cc.commands_sent, str(now - cc.last_command_time)] for cc in control_connections]}
+            data = {'aaData': [[
+                '{0}:{1}'.format(*socket.getnameinfo(cc.client_address, socket.NI_NUMERICSERV)),
+                '{country_name}, {city}'.format(**geoip.record_by_addr(cc.client_address[0])),
+                str(now - cc.start_time),
+                cc.commands_sent,
+                str(now - cc.last_command_time)
+            ] for cc in control_connections]}
             body = json.dumps(data)
             content_type = 'application/json'
         elif self.path.startswith('/proxy-connections'):
-            data = {'aaData': [['{0}:{1}'.format(*socket.getnameinfo(pc.client_address, 0)), pc.last_request, str(now - pc.start_time), str(now - pc.last_send_time)] for pc in proxy_connections]}
+            data = {'aaData': [['{0}:{1}'.format(*socket.getnameinfo(pc.client_address, socket.NI_NUMERICSERV)), pc.last_request, str(now - pc.start_time), str(now - pc.last_send_time)] for pc in proxy_connections]}
             body = json.dumps(data)
             content_type = 'application/json'
         elif self.path.startswith('/server-connections'):
