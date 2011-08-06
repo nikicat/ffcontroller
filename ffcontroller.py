@@ -28,19 +28,17 @@ host_connections = defaultdict(deque)
 
 class ControlConnectionHandler(socketserver.StreamRequestHandler):
     def setup(self):
-        client_name = socket.getnameinfo(self.client_address, 0)
+        client_name = socket.getnameinfo(self.client_address, socket.NI_NUMERICSERV)
         self.logger = logging.getLogger('ffcontroller.control-connection.{0}'.format(*client_name))
         self.start_time = datetime.datetime.now()
         self.last_command_time = self.start_time
         self.commands_sent = 0
-        global control_connections
         control_connections.append(self)
         self.logger.debug('started')
         socketserver.StreamRequestHandler.setup(self)
         self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
     def handle(self):
-        global netloc_queue
         while True:
             try:
                 netlocs = netloc_queue.get(timeout=10)
@@ -100,7 +98,7 @@ class BackHTTPConnection(http.client.HTTPConnection):
                 self.logger.debug('timeout while accepting back connection. resending request.')
         else:
             raise socket.timeout('timeout while trying to establish back connection')
-        self.logger.debug('accepted back connection from {0}:{1}'.format(*socket.getnameinfo(peeraddr, 0)))
+        self.logger.debug('accepted back connection from {0}:{1}'.format(*socket.getnameinfo(peeraddr, socket.NI_NUMERICSERV)))
         # close server socket
         backserv.close()
 
@@ -264,8 +262,8 @@ class HTTPProxyRequestHandler(http.server.BaseHTTPRequestHandler):
                 dest._sock.close()
                 source._sock.close()
 
-        client_addr = '{0}:{1}'.format(*socket.getnameinfo(self.request.getpeername(), 0))
-        server_addr = '{0}:{1}'.format(*socket.getnameinfo(backconn.sock.getpeername(), 0))
+        client_addr = '{0}:{1}'.format(*socket.getnameinfo(self.request.getpeername(), socket.NI_NUMERICSERV))
+        server_addr = '{0}:{1}'.format(*socket.getnameinfo(backconn.sock.getpeername(), socket.NI_NUMERICSERV))
         self.logger.debug('pumping between {0} and {1}'.format(client_addr, server_addr))
         pump_threads = [threading.Thread(target=pump, args=(backconn.sock.makefile('rb', 0), self.wfile), name='s2c'),
                         threading.Thread(target=pump, args=(self.rfile, backconn.sock.makefile('wb', 0)), name='c2s')]
