@@ -12,6 +12,8 @@ import http.client
 import json
 import datetime
 from collections import defaultdict, deque
+import itertools
+import errno
 
 global logger
 global options
@@ -35,18 +37,24 @@ class ControlConnectionHandler(socketserver.StreamRequestHandler):
         control_connections.append(self)
         self.logger.debug('started')
         socketserver.StreamRequestHandler.setup(self)
+        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
     def handle(self):
         global netloc_queue
         while True:
-            netlocs = netloc_queue.get()
             try:
+                netlocs = netloc_queue.get(timeout=10)
                 command = 'TCPCONNECT {0} {1}'.format(*netlocs)
                 self.logger.debug('command: {0}'.format(command))
                 command += '\n'
                 self.connection.sendall(command.encode())
                 self.last_command_time = datetime.datetime.now()
                 self.commands_sent += 1
+            except queue.Empty as e:
+                err = self.connection.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                if err != 0:
+                    self.logger.warning('error: {0}'.format(errno.errorcode[err]))
+                    break
             except:
                 netloc_queue.put(netlocs)
                 raise
@@ -62,6 +70,10 @@ class BackHTTPConnection(http.client.HTTPConnection):
         http.client.HTTPConnection.__init__(self, '', 0)
         self.netloc = netloc
         self.logger = logging.getLogger('ffcontroller.host-connection.{0}'.format(netloc))
+        self.start_time = datetime.datetime.now()
+        self.last_request_time = self.start_time
+        self.requests_sent = 0
+        self.last_request = ''
 
     def __str__(self):
         return self.netloc
@@ -69,7 +81,6 @@ class BackHTTPConnection(http.client.HTTPConnection):
     def connect(self):
         # create listening socket for back connection
         backserv = socket.socket()
-        global options
         backserv.settimeout(options.backconn_timeout)
         # bind to some unused port
         backserv.bind((options.backconn_address, 0))
@@ -78,7 +89,7 @@ class BackHTTPConnection(http.client.HTTPConnection):
         self.logger.debug('awaiting back connection on {0}'.format(selfnetloc))
         # start listening
         backserv.listen(1)
-        while True:
+        for i in range(options.retry_count):
             # put both locations to queue
             netloc_queue.put((selfnetloc, self.netloc))
             # wait for connection
@@ -87,6 +98,8 @@ class BackHTTPConnection(http.client.HTTPConnection):
                 break
             except socket.timeout:
                 self.logger.debug('timeout while accepting back connection. resending request.')
+        else:
+            raise socket.timeout('timeout while trying to establish back connection')
         self.logger.debug('accepted back connection from {0}:{1}'.format(*socket.getnameinfo(peeraddr, 0)))
         # close server socket
         backserv.close()
@@ -95,6 +108,10 @@ class BackHTTPConnection(http.client.HTTPConnection):
         if self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) != 0:
             self.close()
         return self.sock is not None
+
+    def request(self, method, url, body=None, headers={}):
+        self.logger.debug('request: {0} {1}'.format(method, url))
+        http.client.HTTPConnection.request(self, method, url, body, headers)
 
 class HTTPProxyRequestHandler(http.server.BaseHTTPRequestHandler):
     rbufsize = 0
@@ -105,6 +122,7 @@ class HTTPProxyRequestHandler(http.server.BaseHTTPRequestHandler):
         self.start_time = datetime.datetime.now()
         self.last_send_time = self.start_time
         self.peernetloc = ''
+        self.last_request = ''
         global proxy_connections
         proxy_connections.append(self)
         http.server.BaseHTTPRequestHandler.setup(self)
@@ -117,6 +135,7 @@ class HTTPProxyRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.logger.info('{0} {1} {2}'.format(self.command, self.path, self.request_version))
+        self.last_request = '{0} {1} {2}'.format(self.command, self.path, self.request_version)
         for key, value in self.headers.items():
             self.logger.debug('request header: "{0}: {1}"'.format(key, value))
         r = urllib.parse.urlparse(self.path)
@@ -219,6 +238,7 @@ class HTTPProxyRequestHandler(http.server.BaseHTTPRequestHandler):
     do_POST = do_PUT = do_HEAD = do_GET
 
     def do_CONNECT(self):
+        self.last_request = '{0} {1} {2}'.format(self.command, self.path, self.request_version)
         try:
             backconn = BackHTTPConnection(self.path)
             backconn.connect()
@@ -270,14 +290,19 @@ class AdminRequestHandler(http.server.BaseHTTPRequestHandler):
             <script type="text/javascript" language="javascript" src="http://www.datatables.net/release-datatables/media/js/jquery.dataTables.js"></script>
             <script type="text/javascript" charset="utf-8">
                 $(document).ready(function() {
-                    var oTable = $('#control-connections').dataTable( {
+                    $('#control-connections').dataTable( {
                         "bProcessing": true,
                         "sAjaxSource": '/control-connections',
                         "bJQueryUI": true
                     } );
-                    var oTable = $('#proxy-connections').dataTable( {
+                    $('#proxy-connections').dataTable( {
                         "bProcessing": true,
                         "sAjaxSource": '/proxy-connections',
+                        "bJQueryUI": true
+                    } );
+                    $('#server-connections').dataTable( {
+                        "bProcessing": true,
+                        "sAjaxSource": '/server-connections',
                         "bJQueryUI": true
                     } );
 
@@ -298,7 +323,18 @@ class AdminRequestHandler(http.server.BaseHTTPRequestHandler):
                 <table class="display" id="proxy-connections">
                     <thead>
                         <th>Client address</th>
+                        <th>Last request</th>
+                        <th>Established time</th>
+                        <th>Idle time</th>
+                    </thead>
+                    <tbody>
+                    </tbody>
+                </table>
+                <table class="display" id="server-connections">
+                    <thead>
                         <th>Server address</th>
+                        <th>Requests sent</th>
+                        <th>Last request</th>
                         <th>Established time</th>
                         <th>Idle time</th>
                     </thead>
@@ -315,7 +351,11 @@ class AdminRequestHandler(http.server.BaseHTTPRequestHandler):
             body = json.dumps(data)
             content_type = 'application/json'
         elif self.path.startswith('/proxy-connections'):
-            data = {'aaData': [['{0}:{1}'.format(*socket.getnameinfo(pc.client_address, 0)), pc.peernetloc, str(now - pc.start_time), str(now - pc.last_send_time)] for pc in proxy_connections]}
+            data = {'aaData': [['{0}:{1}'.format(*socket.getnameinfo(pc.client_address, 0)), pc.last_request, str(now - pc.start_time), str(now - pc.last_send_time)] for pc in proxy_connections]}
+            body = json.dumps(data)
+            content_type = 'application/json'
+        elif self.path.startswith('/server-connections'):
+            data = {'aaData': [[sc.netloc, sc.requests_sent, sc.last_request, str(now - sc.start_time), str(now - sc.last_request_time)] for sc in itertools.chain(*host_connections.values())]}
             body = json.dumps(data)
             content_type = 'application/json'
         else:
