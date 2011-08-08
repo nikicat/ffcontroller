@@ -74,14 +74,14 @@ class BackHTTPConnection(http.client.HTTPConnection):
     def __init__(self, netloc):
         http.client.HTTPConnection.__init__(self, '', 0)
         self.netloc = netloc
-        self.logger = logging.getLogger('ffcontroller.host-connection.{0}'.format(netloc))
+        self.logger = logging.getLogger('ffcontroller.host-connection.{0}'.format(str(self)))
         self.start_time = datetime.datetime.now()
         self.last_request_time = self.start_time
         self.requests_sent = 0
         self.last_request = ''
 
     def __str__(self):
-        return self.netloc
+        return '{0:X}__{1}'.format(id(self), self.netloc.replace('.', '_').replace(':', '__'))
 
     def connect(self):
         # create listening socket for back connection
@@ -100,6 +100,7 @@ class BackHTTPConnection(http.client.HTTPConnection):
             # wait for connection
             try:
                 self.sock,peeraddr = backserv.accept()
+                self.sock.settimeout(options.transport_timeout)
                 break
             except socket.timeout:
                 self.logger.debug('timeout while accepting back connection. resending request.')
@@ -151,15 +152,17 @@ class HTTPProxyRequestHandler(http.server.BaseHTTPRequestHandler):
                 while len(host_connections[peernetloc]) > 0:
                     backconn = host_connections[peernetloc].popleft()
                     if backconn.check():
-                        self.logger.debug('reusing connection: {0}'.format(backconn))
+                        self.logger.debug('reusing host connection: {0}'.format(backconn))
                         break
                 else:
                     backconn = BackHTTPConnection(peernetloc)
+                    self.logger.debug('creating new host connection: {0}'.format(backconn))
                 response = self.send_request(r, backconn)
                 self.send_full_response(response)
                 if backconn.sock is not None and backconn.sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0:
                     # Do not forget to close response to reuse connection later
                     response.close()
+                    assert(backconn.sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0)
                     self.logger.debug('storing connection for reusing later: {0}'.format(backconn))
                     host_connections[peernetloc].append(backconn)
                 break
@@ -275,6 +278,12 @@ class HTTPProxyRequestHandler(http.server.BaseHTTPRequestHandler):
         list(map(threading.Thread.start, pump_threads))
         list(map(threading.Thread.join, pump_threads))
 
+def get_location(address):
+    record = geoip.record_by_addr(address)
+    country_name = record.get('country_name', '')
+    city = record.get('city', b'').decode()
+    return '{0}, {1}'.format(country_name, city)
+
 class AdminRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         now = datetime.datetime.now()
@@ -312,6 +321,7 @@ class AdminRequestHandler(http.server.BaseHTTPRequestHandler):
             </script>
             <body>
                 <div class="demo_jui">
+                <h1>Control connections</h1>
                 <table class="display" id="control-connections">
                     <thead>
                         <th>Client address</th>
@@ -323,6 +333,7 @@ class AdminRequestHandler(http.server.BaseHTTPRequestHandler):
                     <tbody>
                     </tbody>
                 </table>
+                <h1>Proxy connection</h1>
                 <table class="display" id="proxy-connections">
                     <thead>
                         <th>Client address</th>
@@ -333,6 +344,7 @@ class AdminRequestHandler(http.server.BaseHTTPRequestHandler):
                     <tbody>
                     </tbody>
                 </table>
+                <h1>Server connections</h1>
                 <table class="display" id="server-connections">
                     <thead>
                         <th>Server address</th>
@@ -352,7 +364,7 @@ class AdminRequestHandler(http.server.BaseHTTPRequestHandler):
         elif self.path.startswith('/control-connections'):
             data = {'aaData': [[
                 '{0}:{1}'.format(*socket.getnameinfo(cc.client_address, socket.NI_NUMERICSERV)),
-                '{country_name}, {city}'.format(**geoip.record_by_addr(cc.client_address[0])),
+                get_location(cc.client_address[0]),
                 str(now - cc.start_time),
                 cc.commands_sent,
                 str(now - cc.last_command_time)
@@ -409,6 +421,7 @@ if __name__ == '__main__':
     parser.add_argument('--admin-address', dest='admin_address', default='::')
     parser.add_argument('--admin-port', dest='admin_port', type=int, default=4002)
     parser.add_argument('--retry-count', dest='retry_count', type=int, default=3)
+    parser.add_argument('--transport-timeout', dest='transport_timeout', type=float, default=3.0)
 
     global options
     options = parser.parse_args()
