@@ -22,12 +22,59 @@ global options
 global control_connections
 global proxy_connections
 global host_connections
+global proxy_port_range
 logger = logging.basicConfig(level=logging.DEBUG)
-netloc_queue = queue.Queue()
+global_queue = queue.Queue()
 control_connections = []
 proxy_connections = []
-host_connections = defaultdict(deque)
 geoip = pygeoip.GeoIP('/usr/share/GeoIP/GeoIPCity.dat')
+
+class MixedQueue(queue.Queue):
+    def __init__(self, other):
+        self.other = other
+        self.maxsize = 0
+        self._init(self.maxsize)
+        self.mutex = other.mutex
+        self.not_empty = other.not_empty
+        self.not_full = other.not_full
+        self.all_tasks_done = other.all_tasks_done
+        self.unfinished_tasks = 0
+
+    def _qsize(self):
+        return len(self.queue) + self.other._qsize()
+
+    def _get(self):
+        if len(self.queue) > 0:
+            return self.queue.popleft()
+        else:
+            return self.other._get()
+
+class ThreadingMixin(socketserver.ThreadingMixIn):
+    def start(self):
+        self.thread = threading.Thread(target=self.serve_forever)
+        self.thread.start()
+
+class ThreadedTCPServer(ThreadingMixin, socketserver.TCPServer):
+    allow_reuse_address = True
+    def __init__(self, family, sockaddr, handler):
+        self.address_family = family
+        socketserver.TCPServer.__init__(self, sockaddr, handler)
+
+class ThreadedHTTPServer(ThreadingMixin, http.server.HTTPServer):
+    allow_reuse_address = True
+    def __init__(self, family, sockaddr, handler, pool=None):
+        self.address_family = family
+        self.pool = pool
+        http.server.HTTPServer.__init__(self, sockaddr, handler)
+
+def start_server(server_class, handler, address, port, *args):
+    infos = socket.getaddrinfo(address, port, 0, socket.SOCK_STREAM)
+    for family, socktype, proto, canonname, sockaddr in infos:
+        logging.debug('creating {5} with {0} {1} {2} {3} {4}'.format(family, socktype, proto, canonname, sockaddr, server_class.__name__))
+        server = server_class(family, sockaddr, handler, *args)
+        server.start()
+        # TODO: remove this temporary hack
+        return server
 
 class ControlConnectionHandler(socketserver.StreamRequestHandler):
     def setup(self):
@@ -40,6 +87,11 @@ class ControlConnectionHandler(socketserver.StreamRequestHandler):
         self.start_time = datetime.datetime.now()
         self.last_command_time = self.start_time
         self.commands_sent = 0
+        self.queue = MixedQueue(global_queue)
+        # start dedicated server for us
+        self.proxy_server = start_server(ThreadedHTTPServer, HTTPProxyRequestHandler, options.proxy_address, proxy_port_range.popleft(), HostConnectionPool(self.queue))
+        self.proxy_server.start()
+        # register self for statistics
         control_connections.append(self)
         self.logger.debug('started')
         socketserver.StreamRequestHandler.setup(self)
@@ -48,7 +100,7 @@ class ControlConnectionHandler(socketserver.StreamRequestHandler):
     def handle(self):
         while True:
             try:
-                netlocs = netloc_queue.get(timeout=10)
+                netlocs = self.queue.get(timeout=10)
                 command = 'TCPCONNECT {0} {1}'.format(*netlocs)
                 self.logger.debug('command: {0}'.format(command))
                 command += '\n'
@@ -61,17 +113,18 @@ class ControlConnectionHandler(socketserver.StreamRequestHandler):
                     self.logger.warning('error: {0}'.format(errno.errorcode[err]))
                     break
             except:
-                netloc_queue.put(netlocs)
+                self.queue.put(netlocs)
                 raise
 
     def finish(self):
         socketserver.StreamRequestHandler.finish(self)
+        self.proxy_server.shutdown()
+        proxy_port_range.append(self.proxy_server.server_port)
         self.logger.info('finished')
-        global control_connections
         control_connections.remove(self)
 
 class BackHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, netloc):
+    def __init__(self, netloc, queue):
         http.client.HTTPConnection.__init__(self, '', 0)
         self.netloc = netloc
         self.logger = logging.getLogger('ffcontroller.host-connection.{0}'.format(str(self)))
@@ -79,6 +132,7 @@ class BackHTTPConnection(http.client.HTTPConnection):
         self.last_request_time = self.start_time
         self.requests_sent = 0
         self.last_request = ''
+        self.queue = queue
 
     def __str__(self):
         return '{0:X}__{1}'.format(id(self), self.netloc.replace('.', '_').replace(':', '__'))
@@ -96,7 +150,7 @@ class BackHTTPConnection(http.client.HTTPConnection):
         backserv.listen(1)
         for i in range(options.retry_count):
             # put both locations to queue
-            netloc_queue.put((selfnetloc, self.netloc))
+            self.queue.put((selfnetloc, self.netloc))
             # wait for connection
             try:
                 self.sock,peeraddr = backserv.accept()
@@ -118,6 +172,35 @@ class BackHTTPConnection(http.client.HTTPConnection):
     def request(self, method, url, body=None, headers={}):
         self.logger.debug('request: {0} {1}'.format(method, url))
         http.client.HTTPConnection.request(self, method, url, body, headers)
+
+class HostConnectionPool(object):
+    def __init__(self, queue):
+        self.queue = queue
+        self.host_connections = defaultdict(deque)
+        self.logger = logging.getLogger('ffcontroller.host-connection-pool.{0:X}'.format(id(self)))
+
+    def create(self, peernetloc):
+        backconn = BackHTTPConnection(peernetloc, self.queue)
+        self.logger.debug('created new host connection: {0}'.format(backconn))
+        return backconn
+
+    def acquire(self, peernetloc):
+        while len(self.host_connections[peernetloc]) > 0:
+            backconn = self.host_connections[peernetloc].popleft()
+            if backconn.check():
+                self.logger.debug('reusing host connection: {0}'.format(backconn))
+                break
+        else:
+            backconn = self.create(peernetloc)
+        return backconn
+
+    def release(self, peernetloc, backconn):
+        if backconn.sock is not None and backconn.sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0:
+            # Do not forget to close response to reuse connection later
+            self.logger.debug('storing connection for reusing later: {0}'.format(backconn))
+            self.host_connections[peernetloc].append(backconn)
+
+global_connection_pool = HostConnectionPool(global_queue)
 
 class HTTPProxyRequestHandler(http.server.BaseHTTPRequestHandler):
     rbufsize = 0
@@ -149,22 +232,11 @@ class HTTPProxyRequestHandler(http.server.BaseHTTPRequestHandler):
             peernetloc += ':' + str(port)
         for i in range(options.retry_count):
             try:
-                while len(host_connections[peernetloc]) > 0:
-                    backconn = host_connections[peernetloc].popleft()
-                    if backconn.check():
-                        self.logger.debug('reusing host connection: {0}'.format(backconn))
-                        break
-                else:
-                    backconn = BackHTTPConnection(peernetloc)
-                    self.logger.debug('creating new host connection: {0}'.format(backconn))
+                backconn = self.server.pool.acquire(peernetloc)
                 response = self.send_request(r, backconn)
                 self.send_full_response(response)
-                if backconn.sock is not None and backconn.sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0:
-                    # Do not forget to close response to reuse connection later
-                    response.close()
-                    assert(backconn.sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0)
-                    self.logger.debug('storing connection for reusing later: {0}'.format(backconn))
-                    host_connections[peernetloc].append(backconn)
+                response.close()
+                self.server.pool.release(peernetloc, backconn)
                 break
             except Exception as e:
                 self.logger.error('{0}: {1}'.format(type(e).__name__, e))
@@ -245,11 +317,12 @@ class HTTPProxyRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_CONNECT(self):
         self.last_request = '{0} {1} {2}'.format(self.command, self.path, self.request_version)
         try:
-            backconn = BackHTTPConnection(self.path)
+            backconn = self.server.pool.create(self.path)
             backconn.connect()
             self.send_response(200)
         except:
             self.send_response(503)
+            return
         finally:
             self.end_headers()
             self.last_send_time = datetime.datetime.now()
@@ -281,7 +354,7 @@ class HTTPProxyRequestHandler(http.server.BaseHTTPRequestHandler):
 def get_location(address):
     record = geoip.record_by_addr(address)
     country_name = record.get('country_name', '')
-    city = record.get('city', b'').decode()
+    city = record.get('city', b'')
     return '{0}, {1}'.format(country_name, city)
 
 class AdminRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -326,6 +399,7 @@ class AdminRequestHandler(http.server.BaseHTTPRequestHandler):
                     <thead>
                         <th>Client address</th>
                         <th>Geolocation</th>
+                        <th>Port</th>
                         <th>Established time</th>
                         <th>Commands sent</th>
                         <th>Idle time</th>
@@ -365,6 +439,7 @@ class AdminRequestHandler(http.server.BaseHTTPRequestHandler):
             data = {'aaData': [[
                 '{0}:{1}'.format(*socket.getnameinfo(cc.client_address, socket.NI_NUMERICSERV)),
                 get_location(cc.client_address[0]),
+                cc.proxy_server.server_port,
                 str(now - cc.start_time),
                 cc.commands_sent,
                 str(now - cc.last_command_time)
@@ -376,7 +451,7 @@ class AdminRequestHandler(http.server.BaseHTTPRequestHandler):
             body = json.dumps(data)
             content_type = 'application/json'
         elif self.path.startswith('/server-connections'):
-            data = {'aaData': [[sc.netloc, sc.requests_sent, sc.last_request, str(now - sc.start_time), str(now - sc.last_request_time)] for sc in itertools.chain(*host_connections.values())]}
+            data = {'aaData': [[sc.netloc, sc.requests_sent, sc.last_request, str(now - sc.start_time), str(now - sc.last_request_time)] for sc in itertools.chain(*global_connection_pool.host_connections.values())]}
             body = json.dumps(data)
             content_type = 'application/json'
         else:
@@ -390,32 +465,14 @@ class AdminRequestHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    allow_reuse_address = True
-    def __init__(self, family, sockaddr, handler):
-        self.address_family = family
-        socketserver.TCPServer.__init__(self, sockaddr, handler)
-
-class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    allow_reuse_address = True
-    def __init__(self, family, sockaddr, handler):
-        self.address_family = family
-        http.server.HTTPServer.__init__(self, sockaddr, handler)
-
-def start_server(server_class, handler, address, port):
-    infos = socket.getaddrinfo(address, port, 0, socket.SOCK_STREAM)
-    for family, socktype, proto, canonname, sockaddr in infos:
-        logging.debug('creating {5} with {0} {1} {2} {3} {4}'.format(family, socktype, proto, canonname, sockaddr, server_class.__name__))
-        server = server_class(family, sockaddr, handler)
-        thread = threading.Thread(target=server.serve_forever)
-        thread.start()
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--control-address', dest='control_address', default='::')
     parser.add_argument('--control-port', dest='control_port', type=int, default=4000)
     parser.add_argument('--proxy-address', dest='proxy_address', default='::')
     parser.add_argument('--proxy-port', dest='proxy_port', type=int, default=4001)
+    parser.add_argument('--proxy-port-range-start', dest='proxy_port_range_start', type=int, default=5000)
+    parser.add_argument('--proxy-port-range-end', dest='proxy_port_range_end', type=int, default=9999)
     parser.add_argument('--backconn-address', dest='backconn_address', default=socket.getfqdn())
     parser.add_argument('--backconn-timeout', dest='backconn_timeout', type=float, default=3.0)
     parser.add_argument('--admin-address', dest='admin_address', default='::')
@@ -425,7 +482,9 @@ if __name__ == '__main__':
 
     global options
     options = parser.parse_args()
+    global proxy_port_range
+    proxy_port_range = deque(range(options.proxy_port_range_start, options.proxy_port_range_end))
 
     start_server(ThreadedTCPServer, ControlConnectionHandler, options.control_address, options.control_port)
-    start_server(ThreadedHTTPServer, HTTPProxyRequestHandler, options.proxy_address, options.proxy_port)
+    start_server(ThreadedHTTPServer, HTTPProxyRequestHandler, options.proxy_address, options.proxy_port, global_connection_pool)
     start_server(ThreadedHTTPServer, AdminRequestHandler, options.admin_address, options.admin_port)
