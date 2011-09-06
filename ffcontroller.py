@@ -4,6 +4,7 @@ import threading
 import urllib.parse
 import argparse
 import logging
+import logging.config
 import socketserver
 import socket
 import queue
@@ -17,13 +18,11 @@ import errno
 import pygeoip
 import IPy
 
-global logger
 global options
 global control_connections
 global proxy_connections
 global host_connections
 global proxy_port_range
-logger = logging.basicConfig(level=logging.DEBUG)
 global_queue = queue.Queue()
 control_connections = []
 proxy_connections = []
@@ -83,14 +82,14 @@ class ControlConnectionHandler(socketserver.StreamRequestHandler):
         if ip.iptype() == 'IPV4MAP':
             self.client_address = (ip._getIPv4Map().strNormal(), self.client_address[1])
         client_name = socket.getnameinfo(self.client_address, socket.NI_NUMERICSERV)
-        self.logger = logging.getLogger('ffcontroller.control-connection.{0}'.format(*client_name))
+        self.logger = logging.getLogger('ffcontroller.control-connection')
+        threading.current_thread().setName(client_name[0])
         self.start_time = datetime.datetime.now()
         self.last_command_time = self.start_time
         self.commands_sent = 0
         self.queue = MixedQueue(global_queue)
         # start dedicated server for us
-        self.proxy_server = start_server(ThreadedHTTPServer, HTTPProxyRequestHandler, options.proxy_address, proxy_port_range.popleft(), HostConnectionPool(self.queue))
-        self.proxy_server.start()
+        self.proxy_server = start_server(ThreadedHTTPServer, HTTPProxyRequestHandler, options.proxy_address, proxy_port_range.popleft(), ServerConnectionPool(self.queue))
         # register self for statistics
         control_connections.append(self)
         self.logger.debug('started')
@@ -123,11 +122,12 @@ class ControlConnectionHandler(socketserver.StreamRequestHandler):
         self.logger.info('finished')
         control_connections.remove(self)
 
-class BackHTTPConnection(http.client.HTTPConnection):
+class ServerConnection(http.client.HTTPConnection):
     def __init__(self, netloc, queue):
         http.client.HTTPConnection.__init__(self, '', 0)
         self.netloc = netloc
-        self.logger = logging.getLogger('ffcontroller.host-connection.{0}'.format(str(self)))
+        self.logger = logging.getLogger('ffcontroller.server-connection')
+        threading.current_thread().setName(str(self))
         self.start_time = datetime.datetime.now()
         self.last_request_time = self.start_time
         self.requests_sent = 0
@@ -135,7 +135,7 @@ class BackHTTPConnection(http.client.HTTPConnection):
         self.queue = queue
 
     def __str__(self):
-        return '{0:X}__{1}'.format(id(self), self.netloc.replace('.', '_').replace(':', '__'))
+        return '{1}#{0:X}'.format(id(self), self.netloc)
 
     def connect(self):
         # create listening socket for back connection
@@ -157,7 +157,7 @@ class BackHTTPConnection(http.client.HTTPConnection):
                 self.sock.settimeout(options.transport_timeout)
                 break
             except socket.timeout:
-                self.logger.debug('timeout while accepting back connection. resending request.')
+                self.logger.info('timeout while accepting back connection. resending request.')
         else:
             raise socket.timeout('timeout while trying to establish back connection')
         self.logger.debug('accepted back connection from {0}:{1}'.format(*socket.getnameinfo(peeraddr, socket.NI_NUMERICSERV)))
@@ -173,14 +173,14 @@ class BackHTTPConnection(http.client.HTTPConnection):
         self.logger.debug('request: {0} {1}'.format(method, url))
         http.client.HTTPConnection.request(self, method, url, body, headers)
 
-class HostConnectionPool(object):
+class ServerConnectionPool(object):
     def __init__(self, queue):
         self.queue = queue
         self.host_connections = defaultdict(deque)
-        self.logger = logging.getLogger('ffcontroller.host-connection-pool.{0:X}'.format(id(self)))
+        self.logger = logging.getLogger('ffcontroller.server-connection-pool[{0:X}]'.format(id(self)))
 
     def create(self, peernetloc):
-        backconn = BackHTTPConnection(peernetloc, self.queue)
+        backconn = ServerConnection(peernetloc, self.queue)
         self.logger.debug('created new host connection: {0}'.format(backconn))
         return backconn
 
@@ -200,14 +200,15 @@ class HostConnectionPool(object):
             self.logger.debug('storing connection for reusing later: {0}'.format(backconn))
             self.host_connections[peernetloc].append(backconn)
 
-global_connection_pool = HostConnectionPool(global_queue)
+global_connection_pool = ServerConnectionPool(global_queue)
 
 class HTTPProxyRequestHandler(http.server.BaseHTTPRequestHandler):
     rbufsize = 0
     protocol_version = 'HTTP/1.1'
 
     def setup(self):
-        self.logger = logging.getLogger('ffcontroller.http-proxy.{0}_{1}'.format(self.address_string().replace(':','_'), self.client_address[1]))
+        self.logger = logging.getLogger('ffcontroller.http-proxy')
+        threading.current_thread().setName('{0}&{1}'.format(self.address_string(), self.client_address[1]))
         self.start_time = datetime.datetime.now()
         self.last_send_time = self.start_time
         self.peernetloc = ''
@@ -377,7 +378,8 @@ class AdminRequestHandler(http.server.BaseHTTPRequestHandler):
                     $('#control-connections').dataTable( {
                         "bProcessing": true,
                         "sAjaxSource": '/control-connections',
-                        "bJQueryUI": true
+                        "bJQueryUI": true,
+                        "iDisplayLength": 30
                     } );
                     $('#proxy-connections').dataTable( {
                         "bProcessing": true,
@@ -479,9 +481,17 @@ if __name__ == '__main__':
     parser.add_argument('--admin-port', dest='admin_port', type=int, default=4002)
     parser.add_argument('--retry-count', dest='retry_count', type=int, default=3)
     parser.add_argument('--transport-timeout', dest='transport_timeout', type=float, default=3.0)
+    parser.add_argument('--logging-config', dest='logging_config', default='logging.conf')
 
     global options
     options = parser.parse_args()
+
+    try:
+        logging.config.dictConfig(json.load(open(options.logging_config)))
+    except Exception as e:
+        logging.error('failed to configure logging: {0}'.format(e))
+        logging.exception(e)
+
     global proxy_port_range
     proxy_port_range = deque(range(options.proxy_port_range_start, options.proxy_port_range_end))
 
