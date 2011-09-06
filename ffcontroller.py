@@ -28,6 +28,12 @@ control_connections = []
 proxy_connections = []
 geoip = pygeoip.GeoIP('/usr/share/GeoIP/GeoIPCity.dat')
 
+# Monkey patching conditions in slave queue
+global_queue.not_empty._notify = global_queue.not_empty.notify
+global_queue.not_empty.notify = lambda: global_queue.not_empty._notify(len(global_queue.not_empty._waiters))
+global_queue.not_full._notify = global_queue.not_full.notify
+global_queue.not_full.notify = lambda: global_queue.not_full._notify(len(global_queue.not_full._waiters))
+
 class MixedQueue(queue.Queue):
     def __init__(self, other):
         self.other = other
@@ -43,10 +49,12 @@ class MixedQueue(queue.Queue):
         return len(self.queue) + self.other._qsize()
 
     def _get(self):
-        if len(self.queue) > 0:
-            return self.queue.popleft()
-        else:
+        if queue.Queue._qsize(self) > 0:
+            return queue.Queue._get(self)
+        elif self.other._qsize() > 0:
             return self.other._get()
+        else:
+            raise RuntimeError('MixedQueue: _get() from empty queues')
 
 class ThreadingMixin(socketserver.ThreadingMixIn):
     def start(self):
